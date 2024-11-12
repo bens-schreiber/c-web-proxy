@@ -19,7 +19,7 @@ int main(int argc, char const *argv[])
     }
 
     uint16_t port = (uint16_t)temp_port;
-    start_server(port);
+    serve(port);
 
     return 0;
 }

@@ -2,12 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+// Network libraries
 #include <arpa/inet.h>
 #include <netdb.h>
-
-typedef char buffer_t[0x1000];
-typedef char domain_t[0x100];
-typedef char port_t[6];
 
 #ifndef LOGGING
 #define LOGGING 1
@@ -19,12 +17,129 @@ typedef char port_t[6];
 #define LOG(...)
 #endif
 
+// inet and netdb use -1 to indicate an error
+#define CATCH_NET_ERROR(out) if (out == -1)
+
+#define LOOP while (1)
+#define MAX_IN_SERVER_QUEUE 10
+
+#define ipv4_socket() socket(AF_INET, SOCK_STREAM, 0)
+#define block_until_connection_established(fd) accept(fd, NULL, NULL)
+#define block_until_read(fd, buffer, buffer_size) read(fd, buffer, buffer_size)
+
+typedef char buffer_t[0xFFF];
+typedef char domain_t[0xFF];
+typedef char port_t[6]; // max 99999
+
+/// @brief Forward the HTTP request to the remote server.
+static void _proxy_request(int client_fd, const domain_t domain, const port_t port, buffer_t buffer);
+
 /// @brief Extract the domain and port from the buffer
-/// @param domain the domain to connect to
-/// @param port the port to connect to
-/// @param buffer the full HTTP request
-/// @return 1 if the domain and port were successfully extracted, 0 otherwise
-int write_domain_port(domain_t domain, port_t port, buffer_t buffer)
+/// @remark A default port of 80 is used if not specified
+/// @return 1 if the buffer holds a valid GET request and the domain and port were extracted, 0 otherwise
+static int _write_domain_port(domain_t domain, port_t port, buffer_t buffer);
+
+/// @brief Write a proxied HTTP GET request to the domain to the buffer
+/// @remarks Assumes a valid HTTP GET request is in the buffer
+/// @return The length of the request
+static int _write_proxy_request(buffer_t buffer, const domain_t domain);
+
+static void _on_connection(int client_fd);
+
+void serve(uint16_t port)
+{
+#pragma region CREATE_SERVER
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;         // IPv4
+    address.sin_addr.s_addr = INADDR_ANY; // Bind to all interfaces, accept connections directed to any of the host’s IP addresses.
+    address.sin_port = htons(port);       // Convert the port number to network byte order (big-endian)
+
+    int server_fd = ipv4_socket();
+    CATCH_NET_ERROR(server_fd)
+    {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+
+    // options: Allow the socket to be reused immediately after it is closed (prevents "Address already in use" errors)
+    CATCH_NET_ERROR(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
+    {
+        perror("setsockopt failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Assign a local address to the socket
+    CATCH_NET_ERROR(bind(server_fd, (struct sockaddr *)&address, sizeof(address)))
+    {
+        perror("bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Mark the socket as a passive socket (a server socket, that will be used to accept incoming connections)
+    CATCH_NET_ERROR(listen(server_fd, MAX_IN_SERVER_QUEUE))
+    {
+        perror("listen failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Server listening on port %d\n", port);
+#pragma endregion CREATE_SERVER
+
+#pragma region LISTEN
+    int client_fd;
+    LOOP
+    {
+        client_fd = block_until_connection_established(server_fd);
+        CATCH_NET_ERROR(client_fd)
+        {
+            perror("accept failed");
+            close(server_fd);
+            exit(EXIT_FAILURE);
+        }
+
+        LOG("Accepted connection\n");
+        _on_connection(client_fd);
+    }
+#pragma endregion LISTEN
+
+    close(server_fd);
+}
+
+static void _on_connection(int client_fd)
+{
+    buffer_t buffer;
+    int bytes_read;
+
+    bytes_read = block_until_read(client_fd, buffer, sizeof(buffer_t));
+    CATCH_NET_ERROR(bytes_read)
+    {
+        perror("read failed");
+        close(client_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    LOG("Received %d bytes from client\n", bytes_read);
+    LOG("Data received: %.*s\n", bytes_read, buffer);
+
+    buffer[bytes_read] = '\0';
+
+    domain_t domain;
+    port_t port;
+    if (_write_domain_port(domain, port, buffer))
+    {
+        _proxy_request(client_fd, domain, port, buffer);
+    }
+
+    close(client_fd);
+    LOG("Connection closed.\n\n");
+}
+
+static int _write_domain_port(domain_t domain, port_t port, buffer_t buffer)
 {
     if (strncmp(buffer, "GET http://", 11) != 0)
     {
@@ -70,18 +185,7 @@ int write_domain_port(domain_t domain, port_t port, buffer_t buffer)
     return 1;
 }
 
-/**
- *
- * As per requirements:
- *
- * Always send the following User-Agent header:
- *     User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3)
- *         Gecko/20120305 Firefox/10.0.3
- *
- * Always send the following Connection header: Connection: close
- * Always send the following Proxy-Connection header: Proxy-Connection: close
- */
-int write_request(buffer_t buffer, domain_t domain)
+static int _write_proxy_request(buffer_t buffer, const domain_t domain)
 {
     char *path_start = strchr(buffer + 11, '/');
     if (!path_start)
@@ -93,118 +197,7 @@ int write_request(buffer_t buffer, domain_t domain)
     return length;
 }
 
-#define IF_ERROR(out) if (out == -1)
-#define LOOP while (1)
-#define MAX_IN_SERVER_QUEUE 10
-
-#define ipv4_socket() socket(AF_INET, SOCK_STREAM, 0)
-#define block_until_connection_established(fd) accept(fd, NULL, NULL)
-#define block_until_read(fd, buffer, buffer_size) read(fd, buffer, buffer_size)
-
-/// @brief Forward the HTTP request to the remote server
-/// @param client_fd the client socket file descriptor
-/// @param domain domain name of the remote server
-/// @param port port number of the remote server
-/// @param buffer the full HTTP request
-/// @param bytes_read number of bytes read from the client
-void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer, int bytes_read);
-
-void handle_connection(int client_fd);
-
-/// @brief Attempt to listen for incoming connections on the specified port
-/// @param port The port to listen on
-void start_server(uint16_t port)
-{
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;         // IPv4
-    address.sin_addr.s_addr = INADDR_ANY; // Bind to all interfaces, accept connections directed to any of the host’s IP addresses.
-    address.sin_port = htons(port);       // Convert the port number to network byte order (big-endian)
-
-    int server_fd = ipv4_socket();
-    IF_ERROR(server_fd)
-    {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-
-    int opt = 1;
-
-    // options: Allow the socket to be reused immediately after it is closed (prevents "Address already in use" errors)
-    IF_ERROR(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
-    {
-        perror("setsockopt failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Assign a local address to the socket
-    IF_ERROR(bind(server_fd, (struct sockaddr *)&address, sizeof(address)))
-    {
-        perror("bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Mark the socket as a passive socket (a server socket, that will be used to accept incoming connections)
-    IF_ERROR(listen(server_fd, MAX_IN_SERVER_QUEUE))
-    {
-        perror("listen failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    LOG("Server listening on port %d\n", port);
-
-    int client_fd;
-    LOOP
-    {
-        client_fd = block_until_connection_established(server_fd);
-        LOG("Accepted connection\n");
-
-        IF_ERROR(client_fd)
-        {
-            perror("accept failed");
-            close(server_fd);
-            exit(EXIT_FAILURE);
-        }
-
-        handle_connection(client_fd);
-    }
-
-    close(server_fd);
-}
-
-void handle_connection(int client_fd)
-{
-    buffer_t buffer;
-    int bytes_read;
-
-    bytes_read = block_until_read(client_fd, buffer, sizeof(buffer_t));
-
-    IF_ERROR(bytes_read)
-    {
-        perror("read failed");
-        close(client_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    LOG("Received %d bytes from client\n", bytes_read);
-    LOG("Data received: %.*s\n", bytes_read, buffer);
-
-    buffer[bytes_read] = '\0';
-
-    domain_t domain;
-    port_t port;
-    if (write_domain_port(domain, port, buffer))
-    {
-        proxy_request(client_fd, domain, port, buffer, bytes_read);
-    }
-
-    close(client_fd);
-    LOG("Connection closed.\n\n");
-}
-
-void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer, int bytes_read)
+static void _proxy_request(int client_fd, const domain_t domain, const port_t port, buffer_t buffer)
 {
 
 #pragma region RESOLVE_DOMAIN
@@ -217,7 +210,7 @@ void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer,
     hints.ai_socktype = SOCK_STREAM;
 
     int status = getaddrinfo(domain, port, &hints, &host);
-    IF_ERROR(status)
+    CATCH_NET_ERROR(status)
     {
         fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(status));
         close(client_fd);
@@ -248,26 +241,26 @@ void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer,
     LOG("Resolved domain\n");
 #pragma endregion RESOLVE_DOMAIN
 
+#pragma region WRITE_HTTP_GET_TO_REMOTE
     int remote_server_fd = ipv4_socket();
-    IF_ERROR(remote_server_fd)
+    CATCH_NET_ERROR(remote_server_fd)
     {
         perror("socket failed");
         close(client_fd);
         exit(EXIT_FAILURE);
     }
 
-    IF_ERROR(connect(remote_server_fd, (struct sockaddr *)&server_address, sizeof(server_address)))
+    CATCH_NET_ERROR(connect(remote_server_fd, (struct sockaddr *)&server_address, sizeof(server_address)))
     {
         perror("connect failed");
         close(client_fd);
         close(remote_server_fd);
         exit(EXIT_FAILURE);
     }
-
     LOG("Connected to remote server\n");
 
-    int request_length = write_request(buffer, domain);
-    IF_ERROR(write(remote_server_fd, buffer, request_length))
+    int request_length = _write_proxy_request(buffer, domain);
+    CATCH_NET_ERROR(write(remote_server_fd, buffer, request_length))
     {
         perror("write failed");
         close(client_fd);
@@ -277,13 +270,15 @@ void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer,
 
     LOG("Sent %d bytes to remote server\n", request_length);
     LOG("Data sent: %.*s\n", request_length, buffer);
+#pragma endregion WRITE_HTTP_GET_TO_REMOTE
 
+#pragma region FORWARD_RESPONSE_TO_CLIENT
     int bytes_received = -1;
 
     // Write all of the data from read even if it exceeds the buffer size
     while ((bytes_received = block_until_read(remote_server_fd, buffer, sizeof(buffer_t))) > 0)
     {
-        IF_ERROR(write(client_fd, buffer, bytes_received))
+        CATCH_NET_ERROR(write(client_fd, buffer, bytes_received))
         {
             perror("remote write failed");
             close(client_fd);
@@ -293,14 +288,14 @@ void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer,
         LOG("Received %d bytes from remote server\n", bytes_received);
         LOG("Data received: %.*s\n", bytes_received, buffer);
     }
-
-    IF_ERROR(bytes_received)
+    CATCH_NET_ERROR(bytes_received)
     {
         perror("remote read failed");
         close(client_fd);
         close(remote_server_fd);
         exit(EXIT_FAILURE);
     }
+#pragma endregion FORWARD_RESPONSE_TO_CLIENT
 
     close(remote_server_fd);
 }

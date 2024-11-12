@@ -4,3 +4,5 @@ __pycache__
 venv
 a.out
 test.out
+*.o
+proxy_server
