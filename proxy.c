@@ -99,6 +99,7 @@ int write_request(buffer_t buffer, domain_t domain)
 
 #define ipv4_socket() socket(AF_INET, SOCK_STREAM, 0)
 #define block_until_connection_established(fd) accept(fd, NULL, NULL)
+#define block_until_read(fd, buffer, buffer_size) read(fd, buffer, buffer_size)
 
 /// @brief Forward the HTTP request to the remote server
 /// @param client_fd the client socket file descriptor
@@ -160,7 +161,7 @@ void start_server(uint16_t port)
         client_fd = block_until_connection_established(server_fd);
         LOG("Accepted connection\n");
 
-        if (client_fd == -1)
+        IF_ERROR(client_fd)
         {
             perror("accept failed");
             close(server_fd);
@@ -178,8 +179,7 @@ void handle_connection(int client_fd)
     buffer_t buffer;
     int bytes_read;
 
-    // BLOCKING CALL: Read data from the client
-    bytes_read = read(client_fd, buffer, sizeof(buffer));
+    bytes_read = block_until_read(client_fd, buffer, sizeof(buffer_t));
 
     IF_ERROR(bytes_read)
     {
@@ -281,7 +281,7 @@ void proxy_request(int client_fd, domain_t domain, port_t port, buffer_t buffer,
     int bytes_received = -1;
 
     // Write all of the data from read even if it exceeds the buffer size
-    while ((bytes_received = read(remote_server_fd, buffer, sizeof(buffer_t))) > 0) // BLOCKING CALL: Read data from the remote server
+    while ((bytes_received = block_until_read(remote_server_fd, buffer, sizeof(buffer_t))) > 0)
     {
         IF_ERROR(write(client_fd, buffer, bytes_received))
         {
