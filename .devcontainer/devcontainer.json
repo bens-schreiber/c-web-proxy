@@ -1,0 +1,5 @@
+{
+    "name": "C Development Container",
+    "image": "gcc:latest", 
+    "postCreateCommand": "apt-get update && apt-get install -y make"
+}
