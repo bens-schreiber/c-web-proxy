@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/select.h>
+#include <errno.h>
 
 // Network libraries
 #include <arpa/inet.h>
@@ -20,16 +22,52 @@
 // inet and netdb use -1 to indicate an error
 #define CATCH_NET_ERROR(out) if (out == -1)
 
+#define READ_TIMEOUT_SEC 3
 #define LOOP while (1)
 #define MAX_IN_SERVER_QUEUE 10
 
 #define ipv4_socket() socket(AF_INET, SOCK_STREAM, 0)
 #define block_until_connection_established(fd) accept(fd, NULL, NULL)
-#define block_until_read(fd, buffer, buffer_size) read(fd, buffer, buffer_size)
 
 typedef char buffer_t[0xFFF];
 typedef char domain_t[0xFF];
-typedef char port_t[6]; // max 99999
+typedef char port_t[6]; // max [99999]
+
+ssize_t block_until_read(int client_fd, char *buffer, size_t buffer_size)
+{
+    fd_set read_fds;
+    struct timeval timeout;
+    int retval;
+
+    // Initialize the set of active sockets
+    FD_ZERO(&read_fds);
+    FD_SET(client_fd, &read_fds);
+
+    // Set the timeout
+    timeout.tv_sec = READ_TIMEOUT_SEC;
+    timeout.tv_usec = 0;
+
+    // Wait for data to be available on the socket
+    retval = select(client_fd + 1, &read_fds, NULL, NULL, &timeout);
+
+    if (retval == -1)
+    {
+        // Error occurred in select
+        perror("select");
+        return -1;
+    }
+    else if (retval == 0)
+    {
+        // Timeout occurred
+        fprintf(stderr, "Timeout occurred! No data after %d seconds.\n", READ_TIMEOUT_SEC);
+        return -1;
+    }
+    else
+    {
+        // Data is available, read from the socket
+        return read(client_fd, buffer, buffer_size);
+    }
+}
 
 /// @brief Forward the HTTP request to the remote server.
 static void _proxy_request(int client_fd, const domain_t domain, const port_t port, buffer_t buffer);
@@ -98,8 +136,7 @@ void serve(uint16_t port)
         CATCH_NET_ERROR(client_fd)
         {
             perror("accept failed");
-            close(server_fd);
-            exit(EXIT_FAILURE);
+            continue;
         }
 
         LOG("Accepted connection\n");
@@ -112,15 +149,15 @@ void serve(uint16_t port)
 
 static void _on_connection(int client_fd)
 {
-    buffer_t buffer;
-    int bytes_read;
+    buffer_t buffer = {0};
+    int bytes_read = -1;
 
     bytes_read = block_until_read(client_fd, buffer, sizeof(buffer_t));
     CATCH_NET_ERROR(bytes_read)
     {
         perror("read failed");
         close(client_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
 
     LOG("Received %d bytes from client\n", bytes_read);
@@ -213,8 +250,7 @@ static void _proxy_request(int client_fd, const domain_t domain, const port_t po
     CATCH_NET_ERROR(status)
     {
         fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(status));
-        close(client_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
 
     struct sockaddr_in server_address;
@@ -233,8 +269,7 @@ static void _proxy_request(int client_fd, const domain_t domain, const port_t po
     {
         fprintf(stderr, "No valid address found\n");
         freeaddrinfo(host);
-        close(client_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
 
     freeaddrinfo(host);
@@ -247,15 +282,14 @@ static void _proxy_request(int client_fd, const domain_t domain, const port_t po
     {
         perror("socket failed");
         close(client_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
 
     CATCH_NET_ERROR(connect(remote_server_fd, (struct sockaddr *)&server_address, sizeof(server_address)))
     {
         perror("connect failed");
-        close(client_fd);
         close(remote_server_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
     LOG("Connected to remote server\n");
 
@@ -263,9 +297,8 @@ static void _proxy_request(int client_fd, const domain_t domain, const port_t po
     CATCH_NET_ERROR(write(remote_server_fd, buffer, request_length))
     {
         perror("write failed");
-        close(client_fd);
         close(remote_server_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
 
     LOG("Sent %d bytes to remote server\n", request_length);
@@ -281,9 +314,8 @@ static void _proxy_request(int client_fd, const domain_t domain, const port_t po
         CATCH_NET_ERROR(write(client_fd, buffer, bytes_received))
         {
             perror("remote write failed");
-            close(client_fd);
             close(remote_server_fd);
-            exit(EXIT_FAILURE);
+            return;
         }
         LOG("Received %d bytes from remote server\n", bytes_received);
         LOG("Data received: %.*s\n", bytes_received, buffer);
@@ -291,9 +323,8 @@ static void _proxy_request(int client_fd, const domain_t domain, const port_t po
     CATCH_NET_ERROR(bytes_received)
     {
         perror("remote read failed");
-        close(client_fd);
         close(remote_server_fd);
-        exit(EXIT_FAILURE);
+        return;
     }
 #pragma endregion FORWARD_RESPONSE_TO_CLIENT
 

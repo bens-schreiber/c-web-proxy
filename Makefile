@@ -2,9 +2,9 @@
 CC = gcc
 
 # Compiler flags
-CFLAGS = -Wall -Wextra -std=c11 -DLOGGING=0 -D_POSIX_C_SOURCE=200112L
+CFLAGS = -Wall -Wextra -std=c11 -DLOGGING=1 -D_POSIX_C_SOURCE=200112L -g
 
-# Linker flags
+# Linker flags (REQUIRED FOR LINUX)
 LDFLAGS = -lnsl
 
 # Source files
